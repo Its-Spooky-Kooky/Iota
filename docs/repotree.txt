@@ -1,0 +1,97 @@
+iota/
+├── README.md
+├── .env.example
+├── docker-compose.yml                 # spins up postgres+postgis, redis, rabbitmq, minio (local S3), backend
+├── docs/
+│   ├── architecture.md
+│   ├── api-spec.yaml                  # OpenAPI/Swagger spec
+│   └── er-diagram.png
+│
+├── backend/
+│   ├── gateway/                       # API Gateway / BFF
+│   │   ├── src/
+│   │   │   ├── middleware/ (auth.ts, rateLimit.ts)
+│   │   │   ├── routes/
+│   │   │   └── main.ts
+│   │   └── package.json
+│   │
+│   ├── services/
+│   │   ├── issue-service/
+│   │   │   ├── src/
+│   │   │   │   ├── controllers/
+│   │   │   │   ├── models/ (case.model.ts, upvote.model.ts)
+│   │   │   │   ├── state-machine/ (issue.states.ts)
+│   │   │   │   └── main.ts
+│   │   │   └── package.json
+│   │   │
+│   │   ├── identity-service/
+│   │   │   ├── src/
+│   │   │   │   ├── kyc/ (govtIdVerify.ts, otp.ts)
+│   │   │   │   ├── models/ (user.model.ts)
+│   │   │   │   └── main.ts
+│   │   │   └── package.json
+│   │   │
+│   │   ├── routing-service/
+│   │   │   ├── src/
+│   │   │   │   ├── ward-lookup/
+│   │   │   │   ├── dept-mapping/
+│   │   │   │   └── main.ts
+│   │   │   └── package.json
+│   │   │
+│   │   ├── notification-service/
+│   │   │   ├── src/ (fcm.ts, sms.ts, email.ts, main.ts)
+│   │   │   └── package.json
+│   │   │
+│   │   └── ml-service/                # Python
+│   │       ├── app/
+│   │       │   ├── image_hash.py      # perceptual hashing
+│   │       │   ├── embedding.py       # CLIP-style similarity
+│   │       │   ├── geo_cluster.py     # geo-radius duplicate check
+│   │       │   ├── severity.py        # severity scoring model
+│   │       │   ├── consumer.py        # queue consumer
+│   │       │   └── main.py            # FastAPI app
+│   │       ├── requirements.txt
+│   │       └── models/                # ONNX / saved model weights
+│   │
+│   └── shared/
+│       ├── db/ (migrations/, seed/)
+│       └── libs/ (auth-lib, geo-lib, event-schemas)
+│
+├── web/
+│   ├── citizen-app/                   # citizen-facing web app
+│   │   ├── src/
+│   │   │   ├── components/ (MapView, IssueCard, ReportForm, StatusTimeline)
+│   │   │   ├── pages/ (Home, ReportIssue, MyReports, IssueDetail, Profile)
+│   │   │   ├── hooks/ (useOfflineQueue.ts, useGeoLocation.ts)
+│   │   │   ├── offline/ (indexedDbQueue.ts, syncWorker.ts)
+│   │   │   ├── api/ (client.ts)
+│   │   │   └── App.tsx
+│   │   ├── public/
+│   │   └── package.json
+│   │
+│   └── admin-console/                 # municipal staff dashboard
+│       ├── src/
+│       │   ├── components/ (WardHeatmap, PriorityQueue, ResolutionUpload)
+│       │   ├── pages/ (Dashboard, CaseQueue, CaseDetail, Analytics)
+│       │   └── App.tsx
+│       └── package.json
+│
+├── mobile/
+│   └── android/                       # Kotlin (or /flutter if using Flutter)
+│       ├── app/
+│       │   ├── src/main/java/com/iota/
+│       │   │   ├── ui/ (screens: Home, ReportIssue, MyReports, MapScreen, Profile)
+│       │   │   ├── data/
+│       │   │   │   ├── local/ (Room: IssueDao.kt, IssueEntity.kt, AppDatabase.kt)
+│       │   │   │   ├── remote/ (ApiService.kt, RetrofitClient.kt)
+│       │   │   │   └── repository/ (IssueRepository.kt)
+│       │   │   ├── sync/ (SyncWorker.kt — WorkManager background sync)
+│       │   │   ├── location/ (GeoLocationHelper.kt)
+│       │   │   ├── camera/ (CameraCaptureHelper.kt)
+│       │   │   └── MainActivity.kt
+│       │   └── build.gradle
+│       └── settings.gradle
+│
+└── infra/
+    ├── k8s/ (deployment manifests, per-service — for post-hackathon scaling)
+    └── terraform/ (optional, cloud infra as code)
