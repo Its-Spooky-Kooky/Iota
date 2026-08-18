@@ -1,0 +1,1330 @@
+openapi: 3.1.0
+
+info:
+  title: IOTA Civic Issue API
+  version: "1.0.0"
+  contact:
+    name: IOTA Backend Team
+    email: backend@iota.app
+  description: |
+    Public API contract for the IOTA civic-issue reporting system.
+    All requests route through `backend/gateway`; no client ever calls
+    an internal service directly.
+
+    **Token format** (highest-risk drift point — read carefully):
+    Every authenticated request MUST include the header:
+    ```
+    Authorization: Bearer <Firebase ID token>
+    ```
+    The value is the raw Firebase ID token string returned by
+    `FirebaseAuth.getInstance().currentUser.getIdToken(true)` (Android /
+    Firebase Android SDK) or `getAuth().currentUser.getIdToken(true)`
+    (Firebase JS SDK for web).  The gateway calls Firebase Admin SDK's
+    `verifyIdToken()` internally.  **Do NOT Base64-encode or alter the
+    token string.**  The header name is exactly `Authorization` (capital A);
+    no custom header is used.
+
+    Token lifetime is 1 hour.  Clients MUST proactively refresh using
+    `POST /auth/refresh` before expiry (or rely on SDK auto-refresh and
+    re-attach the new token).
+
+servers:
+  - url: https://api.iota.app/v1
+    description: Production
+  - url: http://localhost:4000/v1
+    description: Local dev (gateway)
+
+# ──────────────────────────────────────────────
+# Security
+# ──────────────────────────────────────────────
+components:
+  securitySchemes:
+    FirebaseBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID Token
+      description: |
+        Raw Firebase ID token.  Obtain via the Firebase client SDK
+        (`getIdToken(true)`).  Pass as `Authorization: Bearer <token>`.
+        No encoding, no custom prefix.  Verified server-side by
+        Firebase Admin SDK `verifyIdToken()`.  Expires in 3600 s;
+        refresh before expiry.
+
+  # ── Re-usable response wrappers ──────────────
+  responses:
+    Unauthorized:
+      description: Missing or invalid Firebase token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorBody'
+          example:
+            code: UNAUTHENTICATED
+            message: "Firebase token missing or expired."
+
+    Forbidden:
+      description: Authenticated but insufficient role.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorBody'
+          example:
+            code: FORBIDDEN
+            message: "Officer role required."
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorBody'
+          example:
+            code: NOT_FOUND
+            message: "Issue c3d4e5f6 not found."
+
+    UnprocessableEntity:
+      description: Illegal status transition or validation error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorBody'
+          example:
+            code: ILLEGAL_TRANSITION
+            message: "Cannot move from RESOLVED to ACKNOWLEDGED."
+
+  # ── Shared schemas ───────────────────────────
+  schemas:
+
+    # ── Primitives / Enums ───────────────────
+    IssueStatus:
+      type: string
+      enum:
+        - REPORTED
+        - ACKNOWLEDGED
+        - IN_PROGRESS
+        - RESOLVED
+        - VERIFIED
+      description: |
+        Allowed transitions (server-enforced):
+        REPORTED -> ACKNOWLEDGED -> IN_PROGRESS -> RESOLVED -> VERIFIED
+        Any other jump is rejected with 422.
+      example: REPORTED
+
+    IssueCategory:
+      type: string
+      enum:
+        - ROAD_DAMAGE
+        - WATERLOGGING
+        - GARBAGE
+        - STREETLIGHT
+        - SEWAGE
+        - ENCROACHMENT
+        - OTHER
+      example: ROAD_DAMAGE
+
+    UserRole:
+      type: string
+      enum:
+        - CITIZEN
+        - OFFICER
+        - ADMIN
+      example: CITIZEN
+
+    GeoPoint:
+      type: object
+      description: WGS-84 coordinate pair (GeoJSON-compatible ordering).
+      required:
+        - latitude
+        - longitude
+      properties:
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          example: 18.5204
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          example: 73.8567
+
+    ErrorBody:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          example: "latitude must be between -90 and 90."
+        details:
+          type: object
+          description: Optional structured error details.
+          example:
+            field: latitude
+            received: 91.5
+
+    # ── Auth ────────────────────────────────
+    AuthTokenResponse:
+      type: object
+      required:
+        - firebase_id_token
+        - uid
+        - role
+        - expires_at
+      properties:
+        firebase_id_token:
+          type: string
+          description: Raw Firebase ID token -- pass as Bearer.
+          example: "eyJhbGciOiJSUzI1NiIsImtpZCI6Ij..."
+        refresh_token:
+          type: string
+          description: |
+            Firebase refresh token -- long-lived.  Store securely
+            (Keystore on Android, httpOnly cookie on web).
+          example: "AMf-vBxuVqE7LzK..."
+        uid:
+          type: string
+          description: Firebase UID (also the user.firebase_uid in DB).
+          example: "uXkLp9wQRtZ2mNv4o5yA"
+        role:
+          $ref: '#/components/schemas/UserRole'
+        expires_at:
+          type: integer
+          description: Unix timestamp (seconds) when the ID token expires.
+          example: 1724006400
+
+    RefreshRequest:
+      type: object
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+          example: "AMf-vBxuVqE7LzK..."
+
+    # ── Users ───────────────────────────────
+    UserProfile:
+      type: object
+      required:
+        - id
+        - firebase_uid
+        - role
+        - display_name
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        firebase_uid:
+          type: string
+          example: "uXkLp9wQRtZ2mNv4o5yA"
+        role:
+          $ref: '#/components/schemas/UserRole'
+        display_name:
+          type: string
+          example: "Priya Sharma"
+        phone_number:
+          type: string
+          description: E.164 format; present for citizens (OTP auth).
+          example: "+919876543210"
+        email:
+          type: string
+          format: email
+          description: Present for officers/admins (email/Google auth).
+          example: "officer.mehta@pune.gov.in"
+        ward_id:
+          type: string
+          format: uuid
+          description: Assigned ward (officers only).
+          nullable: true
+          example: "d4e5f6a7-b8c9-0123-def0-456789012345"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-01-15T09:30:00Z"
+
+    # ── Issues ──────────────────────────────
+    IssueCreateRequest:
+      type: object
+      required:
+        - client_uuid
+        - category
+        - description
+        - location
+      properties:
+        client_uuid:
+          type: string
+          format: uuid
+          description: |
+            Client-generated idempotency key.  Generate once, persist
+            locally (Room / IndexedDB) BEFORE the network call.
+            Re-submitting the same UUID returns the existing issue (HTTP
+            200) instead of creating a duplicate (HTTP 201).
+          example: "f1e2d3c4-b5a6-9780-fedc-ba0987654321"
+        category:
+          $ref: '#/components/schemas/IssueCategory'
+        description:
+          type: string
+          minLength: 10
+          maxLength: 1000
+          example: "Large pothole at the junction near Shivaji Market, depth approx 15 cm."
+        location:
+          $ref: '#/components/schemas/GeoPoint'
+        photo_urls:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: |
+            Pre-signed URLs from POST /media/upload -- upload photos
+            first, then include their URLs here.
+          maxItems: 5
+          example:
+            - "https://cdn.iota.app/issues/photo_abc123.webp"
+        address_hint:
+          type: string
+          description: Human-readable address (optional, UI-provided reverse-geocode).
+          maxLength: 255
+          example: "Near Shivaji Market, Camp, Pune 411001"
+
+    IssueResponse:
+      type: object
+      required:
+        - id
+        - client_uuid
+        - category
+        - description
+        - location
+        - status
+        - reporter_id
+        - upvote_count
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+        client_uuid:
+          type: string
+          format: uuid
+          example: "f1e2d3c4-b5a6-9780-fedc-ba0987654321"
+        category:
+          $ref: '#/components/schemas/IssueCategory'
+        description:
+          type: string
+          example: "Large pothole at the junction near Shivaji Market."
+        location:
+          $ref: '#/components/schemas/GeoPoint'
+        address_hint:
+          type: string
+          nullable: true
+          example: "Near Shivaji Market, Camp, Pune 411001"
+        status:
+          $ref: '#/components/schemas/IssueStatus'
+        ward_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null until ML routing completes.
+          example: "d4e5f6a7-b8c9-0123-def0-456789012345"
+        department_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null until ML routing completes.
+          example: "e5f6a7b8-c9d0-1234-ef01-567890123456"
+        severity_score:
+          type: number
+          format: float
+          nullable: true
+          description: 0.0 to 1.0, null until ML scoring completes.
+          example: 0.73
+        duplicate_of_issue_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Non-null if ML flagged this as a duplicate.
+          example: null
+        reporter_id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        photo_urls:
+          type: array
+          items:
+            type: string
+            format: uri
+          example:
+            - "https://cdn.iota.app/issues/photo_abc123.webp"
+        upvote_count:
+          type: integer
+          example: 12
+        has_upvoted:
+          type: boolean
+          description: True if the current user has upvoted this issue.
+          example: false
+        sla_due_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-02-20T23:59:59Z"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-02-15T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-02-16T08:30:00Z"
+
+    IssueListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - page
+        - page_size
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/IssueResponse'
+        total:
+          type: integer
+          example: 143
+        page:
+          type: integer
+          example: 1
+        page_size:
+          type: integer
+          example: 20
+
+    StatusTransitionRequest:
+      type: object
+      required:
+        - to_status
+      properties:
+        to_status:
+          $ref: '#/components/schemas/IssueStatus'
+        note:
+          type: string
+          maxLength: 500
+          example: "Work order WO-2026-0142 raised, crew dispatched."
+        after_photo_url:
+          type: string
+          format: uri
+          description: |
+            Required when to_status is RESOLVED.
+            Must be a pre-signed URL from POST /media/upload.
+          example: "https://cdn.iota.app/issues/after_photo_xyz.webp"
+          nullable: true
+
+    StatusHistoryEntry:
+      type: object
+      required:
+        - id
+        - issue_id
+        - from_status
+        - to_status
+        - actor_id
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "b2c3d4e5-f6a7-8901-bcde-f01234567890"
+        issue_id:
+          type: string
+          format: uuid
+          example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+        from_status:
+          $ref: '#/components/schemas/IssueStatus'
+        to_status:
+          $ref: '#/components/schemas/IssueStatus'
+        actor_id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        note:
+          type: string
+          nullable: true
+          example: "Work order raised, crew dispatched."
+        photo_url:
+          type: string
+          format: uri
+          nullable: true
+          example: "https://cdn.iota.app/issues/after_photo_xyz.webp"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-02-16T08:30:00Z"
+
+    # ── Upvotes ─────────────────────────────
+    UpvoteResponse:
+      type: object
+      required:
+        - issue_id
+        - upvote_count
+        - has_upvoted
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+          example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+        upvote_count:
+          type: integer
+          example: 13
+        has_upvoted:
+          type: boolean
+          example: true
+
+    # ── Officer queue ────────────────────────
+    OfficerQueueItem:
+      type: object
+      required:
+        - issue
+        - priority_score
+      properties:
+        issue:
+          $ref: '#/components/schemas/IssueResponse'
+        priority_score:
+          type: number
+          format: float
+          description: |
+            Composite triage score = f(severity_score, upvote_count,
+            sla_hours_remaining).  Higher = more urgent.
+          example: 0.91
+        sla_hours_remaining:
+          type: number
+          format: float
+          nullable: true
+          example: 14.5
+
+    OfficerQueueResponse:
+      type: object
+      required:
+        - items
+        - total
+        - page
+        - page_size
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OfficerQueueItem'
+        total:
+          type: integer
+          example: 27
+        page:
+          type: integer
+          example: 1
+        page_size:
+          type: integer
+          example: 20
+
+    # ── Media upload ─────────────────────────
+    MediaUploadRequest:
+      type: object
+      required:
+        - mime_type
+        - file_size_bytes
+      properties:
+        mime_type:
+          type: string
+          enum:
+            - image/jpeg
+            - image/webp
+            - image/png
+          example: "image/webp"
+        file_size_bytes:
+          type: integer
+          maximum: 10485760
+          description: Max 10 MB.
+          example: 2457600
+
+    MediaUploadResponse:
+      type: object
+      required:
+        - upload_url
+        - public_url
+        - expires_at
+      properties:
+        upload_url:
+          type: string
+          format: uri
+          description: Pre-signed PUT URL; client uploads directly to storage.
+          example: "https://cdn.iota.app/upload/presigned/abc123?sig=xyz"
+        public_url:
+          type: string
+          format: uri
+          description: Public read URL -- use this in IssueCreateRequest.photo_urls.
+          example: "https://cdn.iota.app/issues/photo_abc123.webp"
+        expires_at:
+          type: string
+          format: date-time
+          description: Pre-signed URL expiry (upload must complete before this).
+          example: "2026-02-15T10:15:00Z"
+
+    # ── Ward ────────────────────────────────
+    WardResponse:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "d4e5f6a7-b8c9-0123-def0-456789012345"
+        name:
+          type: string
+          example: "Ward 14 - Shivajinagar"
+        boundary_geojson:
+          type: object
+          description: GeoJSON Polygon geometry for the ward boundary.
+          example:
+            type: "Polygon"
+            coordinates:
+              - [[73.84, 18.51], [73.86, 18.51], [73.86, 18.53], [73.84, 18.53], [73.84, 18.51]]
+
+    # ── Department ───────────────────────────
+    DepartmentResponse:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "e5f6a7b8-c9d0-1234-ef01-567890123456"
+        name:
+          type: string
+          example: "Roads and Infrastructure"
+
+    # ── Admin: role assignment ───────────────
+    RoleAssignRequest:
+      type: object
+      x-status: planned
+      required:
+        - user_id
+        - role
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        role:
+          $ref: '#/components/schemas/UserRole'
+        ward_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Required when assigning OFFICER role.
+          example: "d4e5f6a7-b8c9-0123-def0-456789012345"
+
+    AnalyticsSummary:
+      type: object
+      x-status: planned
+      required:
+        - period_start
+        - period_end
+        - total_issues
+        - resolved_issues
+        - avg_resolution_hours
+      properties:
+        period_start:
+          type: string
+          format: date-time
+          example: "2026-02-01T00:00:00Z"
+        period_end:
+          type: string
+          format: date-time
+          example: "2026-02-28T23:59:59Z"
+        ward_id:
+          type: string
+          format: uuid
+          nullable: true
+          example: "d4e5f6a7-b8c9-0123-def0-456789012345"
+        total_issues:
+          type: integer
+          example: 312
+        resolved_issues:
+          type: integer
+          example: 278
+        avg_resolution_hours:
+          type: number
+          format: float
+          example: 38.4
+        by_category:
+          type: object
+          additionalProperties:
+            type: integer
+          example:
+            ROAD_DAMAGE: 95
+            GARBAGE: 87
+            WATERLOGGING: 56
+            OTHER: 74
+
+# ──────────────────────────────────────────────
+# Global security default
+# ──────────────────────────────────────────────
+security:
+  - FirebaseBearer: []
+
+# ──────────────────────────────────────────────
+# Paths
+# ──────────────────────────────────────────────
+paths:
+
+  # ── Auth ──────────────────────────────────
+  /auth/token:
+    post:
+      operationId: exchangeToken
+      summary: Exchange a Firebase ID token for server-side session info
+      description: |
+        Called after Firebase client-SDK sign-in.  Client passes its
+        freshly obtained Firebase ID token; the gateway verifies it,
+        upserts the user record, and returns role + expiry metadata.
+        The response firebase_id_token is the same token echoed back
+        (validated); clients SHOULD store it for Bearer use.
+      security: []
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - firebase_id_token
+              properties:
+                firebase_id_token:
+                  type: string
+                  example: "eyJhbGciOiJSUzI1NiIsImtpZCI6Ij..."
+      responses:
+        '200':
+          description: Token verified, user record upserted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      summary: Refresh Firebase ID token using a Firebase refresh token
+      description: |
+        Thin proxy to Firebase Token REST API.  The gateway calls
+        https://securetoken.googleapis.com/v1/token and returns a
+        new ID token + expiry.  Clients SHOULD call this at least
+        5 minutes before the current token expires.
+      security: []
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New ID token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Current user ───────────────────────────
+  /users/me:
+    get:
+      operationId: getCurrentUser
+      summary: Get current user's profile
+      description: Returns the Firebase-authenticated user's profile, including assigned role and ward.
+      tags: [Users]
+      responses:
+        '200':
+          description: Current user profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    patch:
+      operationId: updateCurrentUser
+      summary: Update current user's display name
+      description: Updates only the display_name field of the authenticated user's profile.
+      tags: [Users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                  minLength: 2
+                  maxLength: 100
+                  example: "Priya Sharma"
+      responses:
+        '200':
+          description: Updated profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Media upload ───────────────────────────
+  /media/upload:
+    post:
+      operationId: requestMediaUpload
+      summary: Request a pre-signed URL for photo upload
+      description: |
+        Client calls this BEFORE submitting an issue.  The server
+        returns a pre-signed PUT URL.  Client PUTs the binary image
+        directly to that URL (no gateway in the upload path), then
+        passes the returned public_url in IssueCreateRequest.
+      tags: [Media]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaUploadRequest'
+      responses:
+        '200':
+          description: Pre-signed upload URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaUploadResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Issues ─────────────────────────────────
+  /issues:
+    post:
+      operationId: createIssue
+      summary: Submit a new civic issue
+      description: |
+        Idempotent: if client_uuid already exists for this user the
+        server returns HTTP 200 with the existing issue body (not 201).
+        A 201 means a new row was created.
+
+        After creation the server enqueues RoutingJobPayload and
+        DedupJobPayload asynchronously -- ward_id, department_id,
+        severity_score, and duplicate_of_issue_id may be null
+        initially and populated later.
+      tags: [Issues]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueCreateRequest'
+      responses:
+        '201':
+          description: Issue created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueResponse'
+        '200':
+          description: Issue already exists for this client_uuid (idempotent return).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+    get:
+      operationId: listIssues
+      summary: List issues (filtered)
+      description: |
+        Citizens see only their own issues by default.
+        Officers and admins can see issues in their ward or all wards.
+      tags: [Issues]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/IssueStatus'
+        - name: category
+          in: query
+          schema:
+            $ref: '#/components/schemas/IssueCategory'
+        - name: ward_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Filter by ward (officer/admin only).
+        - name: reporter_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Filter by reporter; defaults to me for CITIZEN role.
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: sort_by
+          in: query
+          schema:
+            type: string
+            enum: [created_at, severity_score, upvote_count, sla_due_at]
+            default: created_at
+        - name: sort_order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        '200':
+          description: Paginated list of issues.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /issues/{issue_id}:
+    parameters:
+      - name: issue_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+
+    get:
+      operationId: getIssue
+      summary: Get a single issue by ID
+      description: Returns full issue detail including ML-assigned fields. Accessible by the reporter, officers in the same ward, and admins.
+      tags: [Issues]
+      responses:
+        '200':
+          description: Issue detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /issues/{issue_id}/status:
+    parameters:
+      - name: issue_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+
+    patch:
+      operationId: transitionIssueStatus
+      summary: Transition an issue to a new status
+      description: |
+        Officer/Admin only.  Server enforces the state machine:
+        REPORTED -> ACKNOWLEDGED -> IN_PROGRESS -> RESOLVED -> VERIFIED.
+        Illegal transitions return 422.
+
+        after_photo_url is REQUIRED when to_status is RESOLVED.
+        Every successful transition writes a StatusHistory row and
+        triggers a notification to the reporter.
+      tags: [Issues]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatusTransitionRequest'
+      responses:
+        '200':
+          description: Issue with updated status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /issues/{issue_id}/history:
+    parameters:
+      - name: issue_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+
+    get:
+      operationId: getIssueHistory
+      summary: Get status history timeline for an issue
+      description: Returns all status transitions for the issue in ascending chronological order, including actor, notes, and resolution photos.
+      tags: [Issues]
+      responses:
+        '200':
+          description: Ordered list of status transitions (oldest first).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StatusHistoryEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Upvotes ────────────────────────────────
+  /issues/{issue_id}/upvote:
+    parameters:
+      - name: issue_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        example: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+
+    post:
+      operationId: upvoteIssue
+      summary: Upvote an issue (citizen corroboration)
+      description: |
+        Idempotent -- calling again when already upvoted is a no-op (200).
+        Citizens cannot upvote their own issues (returns 403).
+      tags: [Issues]
+      responses:
+        '200':
+          description: Upvote recorded (or already existed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpvoteResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: removeUpvote
+      summary: Remove an upvote
+      description: Removes the authenticated citizen's upvote from the issue. Idempotent -- calling when not upvoted returns 200 with current count.
+      tags: [Issues]
+      responses:
+        '200':
+          description: Upvote removed (or was never cast -- idempotent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpvoteResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Officer queue ──────────────────────────
+  /officer/queue:
+    get:
+      operationId: getOfficerQueue
+      summary: Get prioritised triage queue for the authenticated officer
+      description: |
+        OFFICER/ADMIN only.  Returns issues in the officer's assigned
+        ward, sorted by descending priority_score (composite of
+        severity, upvote count, and SLA urgency).  Excludes RESOLVED
+        and VERIFIED issues by default.
+      tags: [Officer]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/IssueStatus'
+          description: Override default status filter.
+        - name: category
+          in: query
+          schema:
+            $ref: '#/components/schemas/IssueCategory'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: Prioritised queue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfficerQueueResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ── Wards ──────────────────────────────────
+  /wards:
+    get:
+      operationId: listWards
+      summary: List all wards
+      description: Returns all wards. Used by clients to populate ward-selection dropdowns and for offline caching of ward reference data.
+      tags: [Wards]
+      responses:
+        '200':
+          description: All wards.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WardResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /wards/{ward_id}:
+    parameters:
+      - name: ward_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        example: "d4e5f6a7-b8c9-0123-def0-456789012345"
+    get:
+      operationId: getWard
+      summary: Get a single ward (with boundary GeoJSON)
+      description: Returns ward detail including the GeoJSON polygon boundary for map rendering.
+      tags: [Wards]
+      responses:
+        '200':
+          description: Ward with boundary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WardResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Departments ────────────────────────────
+  /departments:
+    get:
+      operationId: listDepartments
+      summary: List all departments
+      description: Returns all departments. Used to populate department-selection UIs and for offline caching.
+      tags: [Departments]
+      responses:
+        '200':
+          description: All departments.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DepartmentResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Admin endpoints ────────────────────────
+  /admin/users:
+    get:
+      operationId: adminListUsers
+      summary: "[Admin] List all users"
+      description: "Admin only (x-status: planned). Returns paginated list of all users with optional role filter."
+      x-status: planned
+      tags: [Admin]
+      parameters:
+        - name: role
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserRole'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated user list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UserProfile'
+                  total:
+                    type: integer
+                    example: 204
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/users/{user_id}/role:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    put:
+      operationId: adminAssignRole
+      summary: "[Admin] Assign a role to a user"
+      description: |
+        Roles are NEVER self-assignable.  Officer role requires
+        ward_id in the request body.
+      x-status: planned
+      tags: [Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleAssignRequest'
+      responses:
+        '200':
+          description: Updated user profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/analytics:
+    get:
+      operationId: adminGetAnalytics
+      summary: "[Admin] Get issue analytics summary"
+      description: "Admin only (x-status: planned). Returns aggregated issue counts and resolution metrics for a given time window, optionally scoped to a single ward."
+      x-status: planned
+      tags: [Admin]
+      parameters:
+        - name: period_start
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+          example: "2026-02-01T00:00:00Z"
+        - name: period_end
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+          example: "2026-02-28T23:59:59Z"
+        - name: ward_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Scope to a single ward; omit for system-wide.
+      responses:
+        '200':
+          description: Analytics summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+tags:
+  - name: Auth
+    description: Firebase token exchange and refresh.
+  - name: Users
+    description: Current user profile management.
+  - name: Media
+    description: Pre-signed upload URLs for photos.
+  - name: Issues
+    description: Issue CRUD, status transitions, upvotes, history.
+  - name: Officer
+    description: Officer triage queue (officer/admin roles only).
+  - name: Wards
+    description: Ward reference data.
+  - name: Departments
+    description: Department reference data.
+  - name: Admin
+    description: Administrative endpoints (admin role only); x-status:planned items included for shape visibility.
